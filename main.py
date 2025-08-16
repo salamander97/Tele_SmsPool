@@ -9,15 +9,48 @@ from config import Config, setup_logging, validate_config
 # Setup logging
 logger = setup_logging()
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     logger.info(f"User {user.id} ({user.username}) started the bot")
 
-    await update.message.reply_text(
-        f"👋 Xin chào {user.first_name}!\n\n{Config.WELCOME_MESSAGE}",
-        parse_mode='HTML'
-    )
+    from database import db
+    from smspool_api import smspool_api
+
+    # Kiểm tra xem user đã có API key chưa
+    existing_user = db.get_user(user.id)
+
+    if existing_user:
+        # User đã đăng nhập rồi, cập nhật balance và hiển thị menu chính
+        try:
+            # Cập nhật balance mới nhất
+            balance_result = await smspool_api.get_balance(existing_user['api_key'])
+            if balance_result['success']:
+                db.update_user_balance(existing_user['user_id'], balance_result['balance'])
+                current_balance = balance_result['balance']
+            else:
+                current_balance = existing_user.get('balance', 0)
+        except:
+            current_balance = existing_user.get('balance', 0)
+
+        await update.message.reply_text(
+            f"👋 Chào mừng {user.first_name} quay trở lại!\n\n"
+            f"✅ Bạn đã đăng nhập với API key SMSPool\n"
+            f"💰 Số dư: ${current_balance}\n\n"
+            f"🤖 Bot đang tự động theo dõi số JP Pokemon cho bạn.\n"
+            f"📱 Khi có số khả dụng, bạn sẽ nhận được thông báo!\n\n"
+            f"📱 Thông báo sẽ tự động gửi sau mỗi 5 phút nếu có số khả dụng!\n\n"
+            f"Chọn một tùy chọn bên dưới:",
+            reply_markup=get_main_menu()
+        )
+    else:
+        # User chưa đăng nhập, yêu cầu API key
+        await update.message.reply_text(
+            f"👋 Xin chào {user.first_name}!\n\n{Config.WELCOME_MESSAGE}",
+            parse_mode='HTML'
+        )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
@@ -25,6 +58,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         Config.HELP_MESSAGE,
         parse_mode='HTML'
     )
+
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /balance command"""
@@ -51,15 +85,48 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ {balance_result['message']}"
         )
 
+
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /test command"""
     user = update.effective_user
-    await update.message.reply_text(
-        f"✅ Bot hoạt động bình thường!\n"
-        f"👤 User ID: {user.id}\n"
-        f"📛 Username: @{user.username}\n"
-        f"🕐 Thời gian: {update.message.date}"
-    )
+    from database import db
+    from smspool_api import smspool_api
+
+    user_data = db.get_user(user.id)
+    if not user_data:
+        await update.message.reply_text("❌ Bạn chưa đăng nhập! Vui lòng gửi API key SMSPool.")
+        return
+
+    await update.message.reply_text("🔍 Testing API endpoints...")
+
+    # Test balance
+    balance_result = await smspool_api.get_balance(user_data['api_key'])
+    balance_msg = f"💰 Balance: {balance_result}"
+
+    # Test stock
+    stock_result = await smspool_api.check_service_availability(user_data['api_key'])
+    stock_msg = f"📱 Stock: {stock_result}"
+
+    # Test price
+    try:
+        price_result = await smspool_api._get_service_price(user_data['api_key'])
+        price_msg = f"💲 Price: ${price_result}"
+    except:
+        price_msg = "💲 Price: Error"
+
+    test_results = f"""🧪 API Test Results:
+
+{balance_msg}
+
+{stock_msg}
+
+{price_msg}
+
+🕐 Time: {update.message.date}
+👤 User: {user.id}"""
+
+    await update.message.reply_text(test_results)
+
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages (API key input)"""
@@ -80,11 +147,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if len(message_text) > 20 and any(c in message_text for c in ['_', '-', '.']):
+    # Kiểm tra xem có phải API key không (ít nhất 20 ký tự và chỉ chứa chữ số, chữ cái)
+    if len(message_text) >= 20 and message_text.replace('_', '').replace('-', '').replace('.', '').isalnum():
         loading_msg = await update.message.reply_text("🔄 Đang xác thực API key...")
         try:
             verification_result = await smspool_api.verify_api_key(message_text)
             await loading_msg.delete()
+
+            # Log chi tiết để debug
+            logger.info(f"API verification result: {verification_result}")
 
             if verification_result['valid']:
                 success = db.save_user(
@@ -127,15 +198,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📖 Sử dụng /help để xem hướng dẫn chi tiết."
         )
 
+
 def get_main_menu():
     """Create main menu inline keyboard"""
     keyboard = [
         [InlineKeyboardButton("💰 Kiểm tra số dư", callback_data='check_balance')],
+        [InlineKeyboardButton("🔍 Check số JP Pokemon", callback_data='check_availability')],
         [InlineKeyboardButton("📱 Thuê số JP Pokemon", callback_data='rent_number')],
         [InlineKeyboardButton("📋 Đơn hàng active", callback_data='active_orders')],
         [InlineKeyboardButton("❓ Hướng dẫn", callback_data='help')]
     ]
     return InlineKeyboardMarkup(keyboard)
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button callbacks"""
@@ -157,6 +231,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == 'check_balance':
         await handle_check_balance(query, user_data)
+    elif query.data == 'check_availability':
+        await handle_check_availability(query, user_data)
     elif query.data == 'rent_number':
         await handle_rent_number(query, user_data)
     elif query.data == 'confirm_rent':
@@ -174,6 +250,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_menu()
         )
 
+
 async def handle_confirm_rent(query, user_data):
     """Handle confirmed number rental"""
     from smspool_api import smspool_api
@@ -184,7 +261,10 @@ async def handle_confirm_rent(query, user_data):
 
     rent_result = await smspool_api.rent_number(user_data['api_key'])
     if rent_result['success']:
-        expires_at = datetime.now() + timedelta(minutes=10)
+        # Sử dụng expires_in từ API hoặc default 10 phút
+        expires_seconds = rent_result.get('expires_in', 600)
+        expires_at = datetime.now() + timedelta(seconds=expires_seconds)
+
         success = db.save_order(
             user_id=user_data['user_id'],
             order_id=rent_result['order_id'],
@@ -198,9 +278,10 @@ async def handle_confirm_rent(query, user_data):
                 f"📱 Số điện thoại: {rent_result['phone_number']}\n"
                 f"🆔 Order ID: {rent_result['order_id']}\n"
                 f"💰 Giá: ${rent_result['price']}\n"
-                f"⏰ Hết hạn lúc: {expires_at.strftime('%H:%M:%S')}\n\n"
+                f"⏰ Hết hạn lúc: {expires_at.strftime('%H:%M:%S')}\n"
+                f"⏱️ Thời gian còn lại: {expires_seconds // 60} phút\n\n"
                 f"🔄 Bot sẽ tự động kiểm tra SMS và thông báo cho bạn.\n"
-                f"⚠️ Nếu sau 10 phút không có SMS, bot sẽ tự động hoàn tiền.",
+                f"⚠️ Nếu sau {expires_seconds // 60} phút không có SMS, bot sẽ tự động hoàn tiền.",
                 reply_markup=get_main_menu()
             )
             logger.info(f"✅ Order {rent_result['order_id']} created for user {user_data['user_id']}")
@@ -214,6 +295,59 @@ async def handle_confirm_rent(query, user_data):
             f"❌ {rent_result['message']}",
             reply_markup=get_main_menu()
         )
+
+
+async def handle_check_availability(query, user_data):
+    """Handle availability check"""
+    from smspool_api import smspool_api
+
+    await query.edit_message_text("🔄 Đang kiểm tra tình trạng số JP Pokemon...")
+    availability = await smspool_api.check_service_availability(user_data['api_key'])
+
+    if availability['available']:
+        # Kiểm tra xem user có đủ tiền không
+        user_balance = user_data.get('balance', 0)
+        service_price = availability['price']
+
+        if user_balance >= service_price:
+            # Đủ tiền - hiển thị nút thuê
+            keyboard = [
+                [InlineKeyboardButton(f"🎮 Thuê số ngay (${availability['price']})", callback_data='confirm_rent')],
+                [InlineKeyboardButton("🔙 Quay lại", callback_data='main_menu')]
+            ]
+            await query.edit_message_text(
+                f"✅ {availability['message']}\n\n"
+                f"📱 Dịch vụ: {availability['service_name']}\n"
+                f"💰 Giá: ${availability['price']}\n"
+                f"💵 Số dư của bạn: ${user_balance}\n"
+                f"⏰ Thời gian chờ SMS: 10 phút\n"
+                f"🔄 Auto hoàn tiền nếu không có SMS\n\n"
+                f"Bạn có muốn thuê số không?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # Không đủ tiền - chỉ hiển thị thông tin
+            needed = service_price - user_balance
+            keyboard = [
+                [InlineKeyboardButton("💰 Kiểm tra số dư", callback_data='check_balance')],
+                [InlineKeyboardButton("🔙 Quay lại", callback_data='main_menu')]
+            ]
+            await query.edit_message_text(
+                f"⚠️ Có {availability['count']} số JP Pokemon nhưng bạn không đủ tiền!\n\n"
+                f"📱 Dịch vụ: {availability['service_name']}\n"
+                f"💰 Giá: ${service_price}\n"
+                f"💵 Số dư hiện tại: ${user_balance}\n"
+                f"📈 Cần thêm: ${needed:.2f}\n\n"
+                f"💳 Vui lòng nạp thêm tiền vào tài khoản SMSPool để thuê số.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    else:
+        await query.edit_message_text(
+            f"❌ {availability['message']}\n\n"
+            f"🔄 Bot sẽ tiếp tục theo dõi và thông báo khi có số khả dụng.",
+            reply_markup=get_main_menu()
+        )
+
 
 async def handle_check_balance(query, user_data):
     """Handle balance check"""
@@ -236,6 +370,7 @@ async def handle_check_balance(query, user_data):
             f"❌ {balance_result['message']}",
             reply_markup=get_main_menu()
         )
+
 
 async def handle_rent_number(query, user_data):
     """Handle number rental"""
@@ -264,6 +399,7 @@ async def handle_rent_number(query, user_data):
             reply_markup=get_main_menu()
         )
 
+
 async def handle_active_orders(query, user_data):
     """Handle active orders display"""
     from database import db
@@ -287,14 +423,45 @@ async def handle_active_orders(query, user_data):
         reply_markup=get_main_menu()
     )
 
+
+async def post_init(application: Application) -> None:
+    """Called after bot initialization"""
+    logger.info("🔄 Khởi tạo monitoring services...")
+    from monitoring import get_monitoring_service
+    monitoring = get_monitoring_service(application.bot)
+    await monitoring.start_monitoring()
+    logger.info("✅ Monitoring services started")
+
+
+async def post_stop(application: Application) -> None:
+    """Called before bot shutdown"""
+    logger.info("🛑 Đang dừng bot...")
+    from monitoring import get_monitoring_service
+    monitoring = get_monitoring_service(application.bot)
+    if monitoring:
+        await monitoring.stop_monitoring()
+
+    # Cleanup smspool session
+    from smspool_api import smspool_api
+    await smspool_api.close()
+
+    # Force stop Telegram updater to avoid conflicts
+    try:
+        await application.updater.stop()
+    except:
+        pass
+
+    logger.info("✅ Bot cleanup completed")
+
+
 def main():
     """Main function"""
     logger.info("🚀 Starting SMS Pool Telegram Bot...")
-    logger.info(
-        f"🔑 Bot Token: {Config.TELEGRAM_BOT_TOKEN[:20]}...{Config.TELEGRAM_BOT_TOKEN[-5:] if Config.TELEGRAM_BOT_TOKEN else 'None'}")
+
     if not validate_config():
         logger.error("❌ Lỗi cấu hình - Bot không thể khởi động")
         return
+
     if not Config.TELEGRAM_BOT_TOKEN or Config.TELEGRAM_BOT_TOKEN == "your_bot_token_here":
         logger.error("❌ Vui lòng cập nhật TELEGRAM_BOT_TOKEN trong file .env")
         print("\n📝 Hướng dẫn lấy Bot Token:")
@@ -303,12 +470,17 @@ def main():
         print("3. Copy token và paste vào file .env")
         print("4. Chạy lại bot")
         return
+
     logger.info("✅ Configuration validated successfully")
 
-    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-    from monitoring import get_monitoring_service
-    monitoring = get_monitoring_service(application.bot)
+    # Tạo application với callbacks và drop_pending_updates
+    application = (Application.builder()
+                   .token(Config.TELEGRAM_BOT_TOKEN)
+                   .post_init(post_init)
+                   .post_stop(post_stop)
+                   .build())
 
+    # Thêm handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("balance", balance_command))
@@ -317,32 +489,23 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     logger.info("✅ Bot handlers đã được thiết lập")
 
-    # Use asyncio.run to manage the event loop
-    asyncio.run(async_main(application, monitoring))
+    logger.info("🔄 Bắt đầu polling...")
 
-async def async_main(application, monitoring):
-    """Async main function"""
-    from smspool_api import smspool_api
+    # Chạy bot với drop_pending_updates để tránh conflict
     try:
-        # Initialize application
-        await application.initialize()
-        # Start monitoring services
-        await monitoring.start_monitoring()
-        logger.info("🔄 Bắt đầu polling...")
-        # Run polling
-        await application.run_polling(
+        application.run_polling(
             poll_interval=1.0,
             timeout=20,
-            drop_pending_updates=True
+            drop_pending_updates=True,  # Quan trọng: drop old updates
+            stop_signals=None  # Disable default signal handlers
         )
     except KeyboardInterrupt:
         logger.info("🛑 Bot đã dừng bởi người dùng")
+    except Exception as e:
+        logger.error(f"❌ Lỗi bot: {e}")
     finally:
-        # Ensure proper cleanup
-        await monitoring.stop_monitoring()
-        await smspool_api.close()
-        await application.stop()
-        await application.shutdown()
+        logger.info("🔄 Bot shutdown completed")
+
 
 if __name__ == '__main__':
     main()
