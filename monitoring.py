@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from config import Config
@@ -18,6 +18,7 @@ class MonitoringService:
         self.is_running = False
         self.monitoring_task = None
         self.sms_checking_task = None
+        self.last_availability_check = {}  # Track last check per user
 
     async def start_monitoring(self):
         """Start background monitoring services"""
@@ -70,7 +71,7 @@ class MonitoringService:
                     try:
                         await self._check_service_for_user(user)
                         # Small delay between users to avoid rate limiting
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)
 
                     except Exception as e:
                         logger.error(f"Error checking service for user {user['user_id']}: {e}")
@@ -100,17 +101,55 @@ class MonitoringService:
             # Check service availability
             availability = await smspool_api.check_service_availability(api_key)
 
-            if availability['available'] and availability['count'] > 0:
+            current_time = datetime.now()
+            last_check = self.last_availability_check.get(user_id, {})
+
+            # Chỉ gửi thông báo nếu:
+            # 1. Service available
+            # 2. Đã qua ít nhất 5 phút từ lần thông báo cuối
+            # 3. Hoặc là lần đầu tiên available
+            should_notify = (
+                    availability['available'] and
+                    (
+                            not last_check.get('was_available', False) or
+                            not last_check.get('last_notification') or
+                            (current_time - last_check.get('last_notification', datetime.min)) > timedelta(minutes=5)
+                    )
+            )
+
+            if should_notify:
                 # Send notification to user
                 await self._send_availability_notification(user_id, availability)
 
-                # Update monitoring status
-                db.update_monitoring_status(user_id, datetime.now(), notification_sent=True)
+                # Update tracking
+                self.last_availability_check[user_id] = {
+                    'was_available': True,
+                    'last_notification': current_time,
+                    'last_check': current_time
+                }
 
+                # Update monitoring status in database
+                db.update_monitoring_status(user_id, current_time, notification_sent=True)
                 logger.info(f"📢 Sent availability notification to user {user_id}")
             else:
-                # Update last check time
-                db.update_monitoring_status(user_id, datetime.now(), notification_sent=False)
+                # Update tracking even if not notifying
+                if user_id in self.last_availability_check:
+                    self.last_availability_check[user_id]['was_available'] = availability['available']
+                    self.last_availability_check[user_id]['last_check'] = current_time
+                else:
+                    self.last_availability_check[user_id] = {
+                        'was_available': availability['available'],
+                        'last_notification': None,
+                        'last_check': current_time
+                    }
+
+                # Update last check time in database
+                db.update_monitoring_status(user_id, current_time, notification_sent=False)
+
+                if availability['available']:
+                    logger.debug(f"Service available for user {user_id} but notification suppressed (too recent)")
+                else:
+                    logger.debug(f"Service not available for user {user_id}")
 
         except Exception as e:
             logger.error(f"Error checking service for user {user['user_id']}: {e}")
@@ -118,18 +157,19 @@ class MonitoringService:
     async def _send_availability_notification(self, user_id: int, availability: Dict[str, Any]):
         """Send service availability notification to user"""
         try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
             keyboard = [
-                [InlineKeyboardButton(f"🎮 Thuê số ngay (${availability['price']})", callback_data='rent_number')],
+                [InlineKeyboardButton(f"🎮 Thuê số ngay (${availability['price']})", callback_data='confirm_rent')],
+                [InlineKeyboardButton("🔍 Kiểm tra lại", callback_data='check_availability')],
                 [InlineKeyboardButton("📋 Xem menu", callback_data='main_menu')]
             ]
 
             message = (
                 f"🚨 THÔNG BÁO: Có số JP Pokemon!\n\n"
-                f"📱 Số lượng có sẵn: {availability['count']}\n"
+                f"📱 Dịch vụ: {availability['service_name']}\n"
                 f"💰 Giá: ${availability['price']}\n"
-                f"⏰ Thời gian: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"⏰ Thời gian: {datetime.now().strftime('%H:%M:%S')}\n"
+                f"🕐 Thời gian chờ SMS: 10 phút\n"
+                f"🔄 Auto hoàn tiền nếu không có SMS\n\n"
                 f"🔥 Hãy nhanh tay thuê số trước khi hết!"
             )
 
@@ -140,9 +180,10 @@ class MonitoringService:
             )
 
         except TelegramError as e:
-            if "blocked" in str(e).lower():
-                logger.warning(f"User {user_id} blocked the bot")
+            if "blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                logger.warning(f"User {user_id} blocked the bot or chat not found")
                 # Optionally deactivate user
+                # db.update_user_active_status(user_id, False)
             else:
                 logger.error(f"Failed to send notification to user {user_id}: {e}")
         except Exception as e:
@@ -222,7 +263,8 @@ class MonitoringService:
                 f"✅ ĐÃ NHẬN ĐƯỢC SMS!\n\n"
                 f"📱 Số điện thoại: {phone_number}\n"
                 f"🆔 Order ID: {order_id}\n"
-                f"📩 Nội dung SMS: {sms_result['sms_content']}\n\n"
+                f"📩 Mã SMS: {sms_result['sms_content']}\n"
+                f"📄 Nội dung đầy đủ: {sms_result['full_sms']}\n\n"
                 f"🎉 Giao dịch hoàn tất thành công!"
             )
 
